@@ -1,0 +1,3 @@
+# pub.dev scores a package on `dart analyze` being clean under the standard
+# lint set, so CI runs exactly this.
+include: package:flutter_lints/flutter.yaml

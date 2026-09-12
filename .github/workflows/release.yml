@@ -1,0 +1,20 @@
+# Managed by the monorepo — edit distribution/mirrors/ there, not here.
+name: Release
+
+# Tag `v0.1.0` → pub.dev `myappaffiliate_flutter 0.1.0`.
+#
+# No credentials are stored: pub.dev's automated publishing trusts this repo
+# through OIDC. Enable it once at
+# pub.dev → package → Admin → Automated publishing → GitHub Actions, with
+# repository `myappaffiliate/myappaffiliate-flutter` and tag pattern `v{{version}}`.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+jobs:
+  publish:
+    permissions:
+      id-token: write
+    uses: dart-lang/setup-dart/.github/workflows/publish.yml@v1
+    with:
+      environment: pub.dev

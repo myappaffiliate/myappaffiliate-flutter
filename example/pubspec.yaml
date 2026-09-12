@@ -1,0 +1,14 @@
+name: myappaffiliate_flutter_example
+description: Minimal integration example for the MyAppAffiliate Flutter SDK.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  myappaffiliate_flutter:
+    path: ../

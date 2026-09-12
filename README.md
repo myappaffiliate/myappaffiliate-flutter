@@ -11,14 +11,15 @@ attributed affiliate id to pass into your billing layer (RevenueCat's
 
 ## Install
 
+```bash
+flutter pub add myappaffiliate_flutter
+```
+
 ```yaml
-# pubspec.yaml
+# or by hand, in pubspec.yaml
 dependencies:
   myappaffiliate_flutter: ^0.1.0
 ```
-
-(Until the pub.dev release, use a git dependency:
-`myappaffiliate_flutter: { git: { url: https://github.com/myappaffiliate/myappaffiliate-flutter } }`.)
 
 ## 1. Configure (once, at launch)
 
