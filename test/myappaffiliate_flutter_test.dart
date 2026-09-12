@@ -21,9 +21,10 @@ class ThrowingHttp implements HttpPoster {
   }
 }
 
-Client makeClient(HttpPoster http, {KeyValueStore? store}) => Client(
+Client makeClient(HttpPoster http, {KeyValueStore? store, String baseUrl = 'https://api.test'}) =>
+    Client(
       apiKey: 'pk_test',
-      baseUrl: 'https://api.test',
+      baseUrl: baseUrl,
       store: store ?? InMemoryStore(),
       http: http,
       now: () => 1000000,
@@ -47,9 +48,24 @@ void main() {
     expect(Client.claimToken(Uri.parse('https://go.x/jess?ct=')), isNull);
   });
 
+  test('referral code parsing, with the claim token always preferred', () {
+    expect(Client.referralCode(Uri.parse('https://app.x/?via=LUMI')), 'LUMI');
+    expect(Client.referralCode(Uri.parse('https://app.x/?ref=LUMI&utm_source=yt')), 'LUMI');
+    expect(Client.referralCode(Uri.parse('https://app.x/?maa_code=JESS20')), 'JESS20');
+    expect(Client.referralCode(Uri.parse('https://app.x/?utm_source=yt')), isNull);
+    expect(Client.claimToken(Uri.parse('https://app.x/?via=LUMI&ct=tok_1')), 'tok_1');
+  });
+
+  test('base url keeps exactly one slash before the path', () async {
+    final http = FakeHttp((_) => const MaaHttpResponse('{}', 200));
+    final client = makeClient(http, baseUrl: 'https://api.test/');
+    await client.identify('user_1');
+    expect(http.requests.first.url.toString(), 'https://api.test/sdk/identify');
+  });
+
   test('attribute stores affiliateId and posts install', () async {
-    final http =
-        FakeHttp((_) => const MaaHttpResponse('{"attributionId":"at_1","affiliateId":"aff_1"}', 200));
+    final http = FakeHttp(
+        (_) => const MaaHttpResponse('{"attributionId":"at_1","affiliateId":"aff_1"}', 200));
     final client = makeClient(http);
     final ok = await client.attribute(Uri.parse('https://go.x/jess?claim_token=abc'));
     expect(ok, isTrue);
@@ -62,10 +78,19 @@ void main() {
     expect(http.requests.first.body, contains('"firstOpenAt":1000000'));
   });
 
-  test('attribute without claim token does nothing', () async {
+  /// Creators share plain `?via=` links at least as often as tracked ones.
+  test('attribute falls back to a referral code in the link', () async {
+    final http = FakeHttp((_) => const MaaHttpResponse('{"affiliateId":"aff_via"}', 200));
+    final client = makeClient(http);
+    expect(await client.attribute(Uri.parse('https://app.x/?via=LUMI&utm_source=yt')), isTrue);
+    expect(await client.attributedAffiliateId(), 'aff_via');
+    expect(http.requests.first.body, contains('LUMI'));
+  });
+
+  test('attribute without any referral does nothing', () async {
     final http = FakeHttp((_) => const MaaHttpResponse('', 200));
     final client = makeClient(http);
-    expect(await client.attribute(Uri.parse('https://go.x/jess')), isFalse);
+    expect(await client.attribute(Uri.parse('https://go.x/jess?utm_source=x')), isFalse);
     expect(http.requests, isEmpty);
   });
 
@@ -102,7 +127,135 @@ void main() {
     expect(await client.attributedAffiliateId(), isNull);
   });
 
-  test('static facade is a safe no-op before configure', () async {
+  group('bootstrap — deferred attribution and retry', () {
+    /// A fresh store install: the store dropped the claim token, so the SDK
+    /// posts an install with neither token nor code and the server matches on
+    /// its side. This is the path that makes link-driven installs attributable.
+    test('asks for a deferred match on a fresh install', () async {
+      final http = FakeHttp(
+          (_) => const MaaHttpResponse('{"affiliateId":"aff_9","matchMethod":"deferred_ip"}', 200));
+      final client = makeClient(http);
+      expect(await client.bootstrap(), isTrue);
+      expect(await client.attributedAffiliateId(), 'aff_9');
+      expect(http.requests.first.body, isNot(contains('claimToken')));
+      expect(http.requests.first.body, isNot(contains('affiliateCode')));
+    });
+
+    test('does nothing when already attributed', () async {
+      final store = InMemoryStore();
+      await store.set('maa.affiliateId', 'aff_existing');
+      final http = FakeHttp((_) => const MaaHttpResponse('', 200));
+      expect(await makeClient(http, store: store).bootstrap(), isFalse);
+      expect(http.requests, isEmpty);
+    });
+
+    /// The deferred ask costs a round trip and can only ever succeed once, so
+    /// it must not fire on every cold launch.
+    test('attempts the deferred match only once per install', () async {
+      final store = InMemoryStore();
+      final http = FakeHttp((_) => const MaaHttpResponse('{}', 404));
+      await makeClient(http, store: store).bootstrap();
+      await makeClient(http, store: store).bootstrap();
+      await makeClient(http, store: store).bootstrap();
+      expect(http.requests, hasLength(1));
+    });
+
+    /// First launch is when a device is most likely offline. Losing the code
+    /// there would lose the creator their commission permanently.
+    test('retries a code the previous launch failed to deliver', () async {
+      final store = InMemoryStore();
+      var online = false;
+      final http = FakeHttp((_) => online
+          ? const MaaHttpResponse('{"affiliateId":"aff_2"}', 200)
+          : const MaaHttpResponse('', 500));
+
+      expect(await makeClient(http, store: store).applyCode('JESS20'), isFalse);
+
+      online = true;
+      final nextLaunch = makeClient(http, store: store);
+      expect(await nextLaunch.bootstrap(), isTrue);
+      expect(await nextLaunch.attributedAffiliateId(), 'aff_2');
+      expect(http.requests[1].body, contains('JESS20'));
+    });
+
+    test('retries a link token the previous launch failed to deliver', () async {
+      final store = InMemoryStore();
+      var online = false;
+      final http = FakeHttp((_) => online
+          ? const MaaHttpResponse('{"affiliateId":"aff_3"}', 200)
+          : const MaaHttpResponse('', 500));
+
+      await makeClient(http, store: store).attribute(Uri.parse('https://go.x/j?claim_token=tok1'));
+
+      online = true;
+      final nextLaunch = makeClient(http, store: store);
+      expect(await nextLaunch.bootstrap(), isTrue);
+      expect(await nextLaunch.attributedAffiliateId(), 'aff_3');
+      expect(http.requests[1].body, contains('tok1'));
+    });
+
+    /// 404 (no click) and 409 (ambiguous — the server refused to guess) are
+    /// final answers. Retrying them forever would hammer the API for nothing.
+    test('final rejections clear the pending payload', () async {
+      for (final status in [404, 409]) {
+        final store = InMemoryStore();
+        final http = FakeHttp((_) => MaaHttpResponse('', status));
+        await makeClient(http, store: store).applyCode('NOPE');
+        expect(await store.get('maa.pendingCode'), isNull, reason: 'status $status');
+
+        await makeClient(http, store: store).bootstrap();
+        expect(http.requests, hasLength(2), reason: 'status $status: must not retry');
+      }
+    });
+  });
+
+  test('reset clears every persisted key', () async {
+    final store = InMemoryStore();
+    final http = FakeHttp((_) => const MaaHttpResponse('{"affiliateId":"aff_1"}', 200));
+    final client = makeClient(http, store: store);
+    await client.applyCode('JESS20');
+    expect(await client.attributedAffiliateId(), isNotNull);
+
+    await client.reset();
+    for (final key in [
+      'maa.deviceId',
+      'maa.affiliateId',
+      'maa.pendingToken',
+      'maa.pendingCode',
+      'maa.deferredTried',
+    ]) {
+      expect(await store.get(key), isNull, reason: key);
+    }
+  });
+
+  group('zero-config', () {
+    test('the host defaults to production when nothing overrides it', () {
+      expect(MyAppAffiliateConfig.resolveApiBaseUrl(null), kDefaultApiBaseUrl);
+      expect(kDefaultApiBaseUrl, 'https://api.myappaffiliate.com');
+    });
+
+    test('an explicit host wins, and a blank one falls through', () {
+      expect(MyAppAffiliateConfig.resolveApiBaseUrl('https://staging.test'), 'https://staging.test');
+      expect(MyAppAffiliateConfig.resolveApiBaseUrl('   '), kDefaultApiBaseUrl);
+    });
+
+    test('an explicit key wins, and a blank one resolves to null', () {
+      expect(MyAppAffiliateConfig.resolveApiKey('pk_live_1'), 'pk_live_1');
+      expect(MyAppAffiliateConfig.resolveApiKey('  '), isNull);
+      // No --dart-define in the test run, so there is nothing to fall back to.
+      expect(MyAppAffiliateConfig.resolveApiKey(null), isNull);
+    });
+
+    /// Without a key nothing can attribute, so start() must report the failure
+    /// rather than leaving a half-configured SDK behind.
+    test('start without any key reports failure and stays inactive', () async {
+      MyAppAffiliate.resetForTesting();
+      expect(await MyAppAffiliate.start(apiKey: ''), isFalse);
+      expect(MyAppAffiliate.isStarted, isFalse);
+    });
+  });
+
+  test('static facade is a safe no-op before start', () async {
     MyAppAffiliate.resetForTesting();
     expect(await MyAppAffiliate.applyCode('JESS20'), isFalse);
     expect(await MyAppAffiliate.identify('u'), isFalse);
@@ -110,15 +263,19 @@ void main() {
   });
 
   test('static facade delegates with injected fakes', () async {
+    MyAppAffiliate.resetForTesting();
     final http = FakeHttp((_) => const MaaHttpResponse('{"affiliateId":"aff_9"}', 200));
-    MyAppAffiliate.configure(
+    final started = await MyAppAffiliate.start(
       apiKey: 'pk_test',
-      baseUrl: 'https://api.test',
+      apiBaseUrl: 'https://api.test',
       storage: InMemoryStore(),
       http: http,
     );
-    expect(await MyAppAffiliate.applyCode('JESS20'), isTrue);
+    expect(started, isTrue);
+    expect(MyAppAffiliate.isStarted, isTrue);
+    // start() alone attributed this install via the deferred match.
     expect(await MyAppAffiliate.attributedAffiliateId(), 'aff_9');
+    expect(await MyAppAffiliate.applyCode('JESS20'), isTrue);
     MyAppAffiliate.resetForTesting();
   });
 }

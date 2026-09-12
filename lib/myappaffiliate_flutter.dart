@@ -1,19 +1,19 @@
 /// MyAppAffiliate Flutter SDK — first-party, deterministic affiliate attribution.
 ///
+/// The whole integration is two calls:
+///
 /// ```dart
-/// MyAppAffiliate.configure(
-///   apiKey: 'pk_live_…',
-///   baseUrl: 'https://api.myappaffiliate.com',
-/// );
-/// // incoming deep link:
-/// await MyAppAffiliate.attribute(uri);
-/// // manual-code fallback:
-/// await MyAppAffiliate.applyCode('JESS20');
-/// // when you know the user:
-/// await MyAppAffiliate.identify(userId);
-/// // before a purchase (e.g. purchases_flutter):
-/// final affiliateId = await MyAppAffiliate.attributedAffiliateId();
+/// await MyAppAffiliate.start(apiKey: 'pk_live_…');  // once, at launch
+/// await MyAppAffiliate.identify(userId);            // once you know the user
 /// ```
+///
+/// The API host is compiled in — you never type a URL. `start` also retries
+/// anything an earlier launch failed to deliver and asks for a deferred match on
+/// a fresh install, so a user who installed from a creator's link is attributed
+/// without you calling anything else.
+///
+/// Everything beyond the two calls — a staging host, handling an incoming deep
+/// link, manual code entry, reading the attributed affiliate — is optional.
 ///
 /// Every network path is silent-safe: failures resolve to `false`/`null` and
 /// never throw into the host app.
@@ -25,9 +25,21 @@ import 'dart:math' as math;
 
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Tiny key/value store the SDK uses to persist the device id and the
-/// attributed affiliate id. Abstracted so the engine is testable without
-/// SharedPreferences.
+/// Where the SDK talks to when nothing overrides it. Mirrors `SITE.api` in
+/// @maa/brand.
+const String kDefaultApiBaseUrl = 'https://api.myappaffiliate.com';
+
+/// Compile-time key, so `flutter build --dart-define=MYAPPAFFILIATE_API_KEY=…`
+/// keeps the key out of source control and `MyAppAffiliate.start()` takes no
+/// arguments at all.
+const String _envApiKey = String.fromEnvironment('MYAPPAFFILIATE_API_KEY');
+
+/// Compile-time host override, for a staging API or a self-hosted deployment.
+const String _envApiBaseUrl = String.fromEnvironment('MYAPPAFFILIATE_API_BASE_URL');
+
+/// Tiny key/value store the SDK uses to persist the device id, the attributed
+/// affiliate id, and any attribution payload still waiting to be delivered.
+/// Abstracted so the engine is testable without SharedPreferences.
 abstract class KeyValueStore {
   Future<String?> get(String key);
   Future<void> set(String key, String? value);
@@ -102,32 +114,83 @@ class IoHttpPoster implements HttpPoster {
   }
 }
 
+/// Trimmed value, or null when absent/blank — a blank override means "unset".
+String? _present(String? value) {
+  final trimmed = value?.trim();
+  return (trimmed == null || trimmed.isEmpty) ? null : trimmed;
+}
+
+/// How the SDK finds its API key and host without either being typed into your
+/// source code: the explicit argument first, then a `--dart-define`, then (for
+/// the host) the compiled-in production default.
+class MyAppAffiliateConfig {
+  const MyAppAffiliateConfig._();
+
+  static String? resolveApiKey(String? explicit) => _present(explicit) ?? _present(_envApiKey);
+
+  static String resolveApiBaseUrl(String? explicit) =>
+      _present(explicit) ?? _present(_envApiBaseUrl) ?? kDefaultApiBaseUrl;
+}
+
 /// The internal engine behind [MyAppAffiliate]. Holds config + storage +
 /// transport. Tests drive [Client] directly with an in-memory store and a
 /// fake HTTP poster.
 class Client {
   Client({
     required this.apiKey,
-    required this.baseUrl,
+    required String baseUrl,
     required this.store,
     required this.http,
+    this.debug = false,
     int Function()? now,
-  }) : now = now ?? (() => DateTime.now().millisecondsSinceEpoch);
+  })  : baseUrl = baseUrl.endsWith('/')
+            ? baseUrl.substring(0, baseUrl.length - 1)
+            : baseUrl,
+        now = now ?? (() => DateTime.now().millisecondsSinceEpoch);
 
   final String apiKey;
   final String baseUrl;
   final KeyValueStore store;
   final HttpPoster http;
+  final bool debug;
   final int Function() now;
 
   static const _deviceIdKey = 'maa.deviceId';
   static const _affiliateIdKey = 'maa.affiliateId';
 
+  /// An attribution payload that hasn't reached the API yet. First launch is
+  /// exactly when a device is most likely offline, so we keep it and retry.
+  static const _pendingTokenKey = 'maa.pendingToken';
+  static const _pendingCodeKey = 'maa.pendingCode';
+
+  /// Set once the server-side deferred match has been attempted, so we ask for
+  /// it once per install instead of on every launch.
+  static const _deferredTriedKey = 'maa.deferredTried';
+
+  /// Query params a referral can arrive under, most trusted first.
+  static const _tokenParams = ['claim_token', 'ct'];
+  static const _codeParams = ['via', 'ref', 'maa_code', 'code'];
+
   /// Extracts the deferred-deep-link claim token (`claim_token` | `ct`).
-  static String? claimToken(Uri uri) {
+  static String? claimToken(Uri uri) => _firstParam(uri, _tokenParams);
+
+  /// Extracts a referral code (`?via=LUMI`). Creators share plain `?via=` links
+  /// as often as tracked ones, and an app that only looked for a claim token
+  /// would silently drop every one of them.
+  static String? referralCode(Uri uri) => _firstParam(uri, _codeParams);
+
+  static String? _firstParam(Uri uri, List<String> names) {
     final params = uri.queryParameters;
-    final token = params['claim_token'] ?? params['ct'];
-    return (token == null || token.isEmpty) ? null : token;
+    for (final name in names) {
+      final value = params[name];
+      if (value != null && value.isNotEmpty) return value;
+    }
+    return null;
+  }
+
+  void _log(String message) {
+    // ignore: avoid_print
+    if (debug) print('[myappaffiliate] $message');
   }
 
   /// Stable per-install device id, generated once and persisted.
@@ -141,15 +204,46 @@ class Client {
 
   Future<String?> attributedAffiliateId() => store.get(_affiliateIdKey);
 
+  /// Runs at launch, before any link or code arrives. In order:
+  ///   1. already attributed → nothing to do
+  ///   2. a payload we failed to deliver earlier → retry it
+  ///   3. otherwise → ask the API for a deferred match, once per install
+  ///
+  /// Step 3 is what makes a fresh store install attributable at all: the store
+  /// drops the claim token, so the server matches on a hashed IP and a short
+  /// time window instead (docs/30 Part 1).
+  Future<bool> bootstrap() async {
+    if (await attributedAffiliateId() != null) return false;
+
+    final token = await store.get(_pendingTokenKey);
+    if (token != null) return _postInstall(claimToken: token);
+
+    final code = await store.get(_pendingCodeKey);
+    if (code != null) return _postInstall(affiliateCode: code);
+
+    if (await store.get(_deferredTriedKey) != null) return false;
+    await store.set(_deferredTriedKey, '1');
+    return _postInstall();
+  }
+
   /// Records attribution from an incoming deep link.
   Future<bool> attribute(Uri uri) async {
     final token = claimToken(uri);
-    if (token == null) return false;
-    return _postInstall(claimToken: token);
+    if (token != null) {
+      await store.set(_pendingTokenKey, token);
+      return _postInstall(claimToken: token);
+    }
+    final code = referralCode(uri);
+    if (code != null) return applyCode(code);
+    _log('no referral in $uri');
+    return false;
   }
 
   /// Manual-code fallback (e.g. a creator's "JESS20").
-  Future<bool> applyCode(String code) => _postInstall(affiliateCode: code);
+  Future<bool> applyCode(String code) async {
+    await store.set(_pendingCodeKey, code);
+    return _postInstall(affiliateCode: code);
+  }
 
   /// Binds the app's user id to the stored attribution.
   Future<bool> identify(String userId) async {
@@ -161,8 +255,23 @@ class Client {
     try {
       final response = await http.post(_endpoint('sdk/identify'), _authHeaders(), body);
       return response.statusCode == 200;
-    } catch (_) {
+    } catch (e) {
+      _log('identify failed: $e');
       return false;
+    }
+  }
+
+  /// Clears every piece of persisted state — after this the device is
+  /// indistinguishable from a fresh install.
+  Future<void> reset() async {
+    for (final key in [
+      _deviceIdKey,
+      _affiliateIdKey,
+      _pendingTokenKey,
+      _pendingCodeKey,
+      _deferredTriedKey,
+    ]) {
+      await store.set(key, null);
     }
   }
 
@@ -176,26 +285,40 @@ class Client {
     final MaaHttpResponse response;
     try {
       response = await http.post(_endpoint('sdk/install'), _authHeaders(), body);
-    } catch (_) {
+    } catch (e) {
+      _log('install failed: $e');
+      return false;
+    }
+
+    // 404 = no attributable click; 409 = an ambiguous deferred match the server
+    // refused to guess at. Both are final answers, not transient failures, so
+    // drop the pending payload instead of retrying it on every launch.
+    if (response.statusCode == 404 || response.statusCode == 409) {
+      await _clearPending();
       return false;
     }
     if (response.statusCode != 200) return false;
+
     try {
       final parsed = jsonDecode(response.body);
       final affiliateId = parsed is Map<String, dynamic> ? parsed['affiliateId'] : null;
       if (affiliateId is String && affiliateId.isNotEmpty) {
         await store.set(_affiliateIdKey, affiliateId);
+        _log('attributed to $affiliateId');
       }
     } catch (_) {
       // Response body is best-effort; the install itself succeeded.
     }
+    await _clearPending();
     return true;
   }
 
-  Uri _endpoint(String path) {
-    final base = baseUrl.endsWith('/') ? baseUrl.substring(0, baseUrl.length - 1) : baseUrl;
-    return Uri.parse('$base/$path');
+  Future<void> _clearPending() async {
+    await store.set(_pendingTokenKey, null);
+    await store.set(_pendingCodeKey, null);
   }
+
+  Uri _endpoint(String path) => Uri.parse('$baseUrl/$path');
 
   Map<String, String> _authHeaders() => {'Authorization': 'Bearer $apiKey'};
 
@@ -222,43 +345,81 @@ class Client {
 }
 
 /// The public surface an app integrates. All methods are static and delegate
-/// to an internal [Client]; every call is safe before `configure` (no-ops).
+/// to an internal [Client]; every call is safe before `start` (no-ops).
 class MyAppAffiliate {
   MyAppAffiliate._();
 
   static Client? _client;
 
-  /// Initialize the SDK. Call once at launch.
+  /// True once [start] has run. Every other call is a safe no-op before it.
+  static bool get isStarted => _client != null;
+
+  /// Start the SDK. Call once at launch.
   ///
-  /// [storage] and [http] are injectable for tests; production uses
-  /// shared_preferences and dart:io.
-  static void configure({
-    required String apiKey,
-    required String baseUrl,
+  /// Pass your key, or omit it and supply it at build time with
+  /// `--dart-define=MYAPPAFFILIATE_API_KEY=pk_live_…`.
+  ///
+  /// [apiBaseUrl] points at a staging API or a self-hosted deployment; leave it
+  /// null in production. [storage] and [http] are injectable for tests;
+  /// production uses shared_preferences and dart:io.
+  ///
+  /// Returns false when no key could be found, which is the one
+  /// misconfiguration worth checking: with no key nothing can ever attribute.
+  static Future<bool> start({
+    String? apiKey,
+    String? apiBaseUrl,
+    bool debug = false,
     KeyValueStore? storage,
     HttpPoster? http,
-  }) {
-    _client = Client(
-      apiKey: apiKey,
-      baseUrl: baseUrl,
+  }) async {
+    final key = MyAppAffiliateConfig.resolveApiKey(apiKey);
+    if (key == null) {
+      // ignore: avoid_print
+      print(
+        '[myappaffiliate] no API key — pass one to MyAppAffiliate.start(apiKey:) or build with '
+        '--dart-define=MYAPPAFFILIATE_API_KEY=… . The SDK is inactive.',
+      );
+      return false;
+    }
+    final client = Client(
+      apiKey: key,
+      baseUrl: MyAppAffiliateConfig.resolveApiBaseUrl(apiBaseUrl),
       store: storage ?? SharedPreferencesStore(),
       http: http ?? const IoHttpPoster(),
+      debug: debug,
     );
+    _client = client;
+    await client.bootstrap();
+    return true;
   }
 
-  /// Handle an incoming deep link; records attribution (`claim_token` | `ct`).
-  static Future<bool> attribute(Uri uri) async => (await _client?.attribute(uri)) ?? false;
-
-  /// Manual-code fallback (e.g. a creator's "JESS20") when no link is available.
-  static Future<bool> applyCode(String code) async => (await _client?.applyCode(code)) ?? false;
-
-  /// Bind the app's user id to the stored attribution (call once you know the user).
+  /// Bind your user id to the attribution — call once you know the user.
+  ///
+  /// This id is the join key for every revenue event that follows, whoever bills
+  /// the customer: it must be the same string your billing provider reports back
+  /// to us (RevenueCat / Adapty / Superwall app user id, Stripe
+  /// `metadata.customer_user_id`, Paddle custom data).
   static Future<bool> identify(String userId) async =>
       (await _client?.identify(userId)) ?? false;
 
-  /// The affiliate id this install was attributed to, if any.
+  /// Claim the referral carried by an incoming deep link — a `claim_token`/`ct`
+  /// from a tracked link, or a `via`/`ref`/`code` param.
+  static Future<bool> attribute(Uri uri) async => (await _client?.attribute(uri)) ?? false;
+
+  /// Manual-code entry (e.g. a "Got a creator code?" field). Works with no
+  /// deep-link setup at all.
+  static Future<bool> applyCode(String code) async => (await _client?.applyCode(code)) ?? false;
+
+  /// The affiliate id this install was attributed to, if any. You do not need
+  /// this for attribution to work — it is here for your own UI and analytics.
   static Future<String?> attributedAffiliateId() async =>
       await _client?.attributedAffiliateId();
+
+  /// Clear all persisted SDK state — call on logout or a data-erasure request.
+  ///
+  /// The SDK stays started: the next launch (or the next link) attributes again
+  /// from scratch, exactly as a fresh install would.
+  static Future<void> reset() async => await _client?.reset();
 
   /// Test hook — reset configuration between tests.
   static void resetForTesting() => _client = null;

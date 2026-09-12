@@ -4,7 +4,7 @@ description: >-
   affiliate attribution with zero tracking. Stores a stable device id, records
   attribution from a link or manual code, and hands you the attributed
   affiliate id to pass into your billing layer.
-version: 0.1.0
+version: 0.2.0
 homepage: https://myappaffiliate.com
 repository: https://github.com/myappaffiliate/myappaffiliate-flutter
 issue_tracker: https://github.com/myappaffiliate/myappaffiliate-flutter/issues
